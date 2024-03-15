@@ -1,34 +1,58 @@
 import pandas as pd
 import numpy as np 
 import os
+import copy
 import torch 
-from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import DataLoader,  TensorDataset
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.model_selection import train_test_split
+import time
+from sklearn.utils import shuffle
 
 
 
-def load_table(savic_features = True, have_images = False, remove_unlabeled = True,
+def load_table(features = "savic", have_images = False, remove_unlabeled = True,
+               separate_AGN = False, remove_missing_features = True,
                directory = os.path.expanduser("~/DATA/data_challenge")):
+    
+    """"Features can be savic, important, photometry, variability
+    """
                
     table = pd.read_parquet(os.path.join(directory, "ObjectTable.parquet"), engine='fastparquet')
     
-    print(f"table has {len(table)} sources")
-    print(table["class"].value_counts())
-               
-    table["label"] = table["class"]
-    table["label"].replace({'Star': 0, 'Gal': 1, 'Qso': 2, 'Agn': 2, 'highZQso': 2}, inplace = True)
+    print(f"Original Table has {len(table)} sources")
+    
+    table["label"] = table["class"].copy()
+    
+    if separate_AGN:
+        table["label"].replace({'Star': 0, 'Gal': 1, 'Qso': 2, 'Agn': 3, 'highZQso': 2}, inplace = True)
+    else:
+        table["label"].replace({'Star': 0, 'Gal': 1, 'Qso': 2, 'Agn': 2, 'highZQso': 2}, inplace = True)
     
     if remove_unlabeled:
        table = table[~np.isnan(table["label"])]
        print(f"Keeping {len(table)} labeled sources")
-    
-    if savic_features:
-       with open("input_files/savic_features.dat", 'r') as f:
+    else: 
+        table.loc[np.isnan(table["label"]), "class"] = "Unlabeled"
+        table.loc[np.isnan(table["label"]), "label"] = np.max(table["label"])+1
+
+
+    features_fname = features.lower()+"_features.dat"
+
+    input_dir = os.path.expanduser("~/WORK/challenge/input_files")
+    try:
+        with open(os.path.join(input_dir, features_fname), 'r') as f:
             feature_list = [line.strip("\n") for line in f]
-       f.close
-       table  = table[feature_list]
-       table.dropna(axis=0, how="any", inplace=True)
-       print(f"Keeping {len(table)} with all features used in Savic+23")
-    
+        f.close
+        table  = table[feature_list]
+        print(f"Keeping only the required {len(feature_list)-2} features")
+    except FileNotFoundError:
+        print(f"Keeping all features")
+
+    if remove_missing_features:
+        table.dropna(axis=0, how="any", inplace=True)
+        print(f"Keeping {len(table)} with all features available")
+
     if have_images:
        images_names = os.listdir(os.path.join(directory, "cutouts"))
        images_names = [i.replace(".npy", "") for i in images_names]
@@ -37,12 +61,15 @@ def load_table(savic_features = True, have_images = False, remove_unlabeled = Tr
        has_image = np.isin(objectID, images_names)
        table = table[has_image]
        print(f"Keeping {len(table)} with available cutouts")
+
+    print(table["class"].value_counts())
     
     return table
 
 
 
 def load_images(objectID, image_shape = 64, cropped_shape = 16, as_tensor = False,
+               normalize = True, 
                homedir = os.path.expanduser("~/DATA/data_challenge/cutouts")):
     """
     Load images and crop them to have  final shape cropped_shape x cropped_shape
@@ -53,7 +80,10 @@ def load_images(objectID, image_shape = 64, cropped_shape = 16, as_tensor = Fals
         filename = name+ ".npy"
         image = np.load(os.path.join(homedir, filename))
         image = image[to_crop: image_shape-to_crop, to_crop:image_shape-to_crop, :]
-        images.append(image/255)
+        images.append(image)
+
+    if normalize:
+        images = [i/255 for i in images]
         
     if as_tensor:
         image_tensor = torch.empty((len(images), cropped_shape, cropped_shape, 3), dtype=torch.float32)
@@ -73,7 +103,7 @@ def transform2tensor(x, y, one_hot = False):
     y_t = y_t.type(torch.LongTensor)
 
     if one_hot:
-        print("Non l'ho ancora implementato")
+        y_t = torch.nn.functional.one_hot(y_t)
     return x_t, y_t
 
 
@@ -140,7 +170,8 @@ def get_bins(array_to_bin,  N_objects = None, N_bins = None, specific_cuts = Non
 def load_variability_table(which_filter = 0, 
                which_columns = ["objectId", "mjd", "psMag", "psMagErr"],
                objectId = None,
-               scale = True, scale_range = (-2, 2),
+               scale_magnitudes = True, magnitudes_scale_range = (-2, 2),
+               scale_time = True, time_scale_range = (-2, 2),
                directory = os.path.expanduser("~/DATA/data_challenge")):
     """
     which_filter: int, 0 = u, 1 = g, 2 = r ....
@@ -158,20 +189,109 @@ def load_variability_table(which_filter = 0,
     
     tables = []   #list of vatiability tables, each containing data for 1 source
     tables_id = []
-    
+    tic = time.perf_counter()
     for id_group, data_group in variability_table.groupby("objectId"):
         if not data_group["psMag"].isnull().all():    #some objects have all nan in lightcurves
                 tables.append(data_group.sort_values("mjd"))
                 tables_id.append(id_group)
+    toc = time.perf_counter()
+    print(f"Created variability tables for {len(tables)} sources in {toc-tic} seconds")
     
-    print(f"Created variability tables for {len(tables)} sources")
-    
-    if scale:
-        scaler = MinMaxScaler(feature_range = scale_range)
+    if scale_magnitudes and scale_time:
+        scaler_4_magnitudes = MinMaxScaler(feature_range = magnitudes_scale_range)
+        scaler_4_time = MinMaxScaler(feature_range = time_scale_range)
         for table in tables:
-            table["mjd"] = table["mjd"] - table["mjd"].iloc[0]
-            table["psMag"] = scaler.fit_transform(table["psMag"].to_numpy().reshape(-1, 1))
-    print("Scaled time and fluxes/magnitudes")
+            table["psMag"] = scaler_4_magnitudes.fit_transform(table["psMag"].to_numpy().reshape(-1, 1))
+            table["mjd"] = scaler_4_time.fit_transform(table["mjd"].to_numpy().reshape(-1, 1))
+    
+    elif scale_time: 
+        scaler_4_time = MinMaxScaler(feature_range = time_scale_range)
+        for table in tables:
+            table["mjd"] = scaler_4_time.fit_transform(table["mjd"].to_numpy().reshape(-1, 1))
+
+    elif scale_magnitudes:
+        scaler_4_magnitudes = MinMaxScaler(feature_range = magnitudes_scale_range)
+        for table in tables:
+            table["psMag"] = scaler_4_magnitudes.fit_transform(table["psMag"].to_numpy().reshape(-1, 1))
+    
+    tic = time.perf_counter()
+    print(f"Scaled time and fluxes/magnitudes in in {tic-toc} seconds")
     
     return tables, tables_id
     
+
+class sample_container():
+    def __init__(self, X, y, objectID):
+        self.X = X
+        self.y = y
+        self.objectID = objectID
+        return None
+    
+    def get_images(self, images):
+        self.images = images
+    
+    def get_tensors(self, one_hot = False):
+        self.X_t, self.y_t = transform2tensor(self.X, self.y, one_hot = one_hot)
+        return None
+
+    def get_dataset(self):
+        if not hasattr(self, "X_t"):
+            self.get_tensors()
+        if hasattr(self, 'images'):
+            self.dataset = TensorDataset(self.X_t, self.images, self.y_t)
+            print("Loading images in the dataset")
+        else:
+            self.dataset = TensorDataset(self.X_t, self.y_t)
+        return None
+    
+    def get_dataloader(self, batch_size = 50, shuffle = True):
+        if not hasattr(self, "dataset"):
+            self.get_dataset()
+        self.dataloader = DataLoader(self.dataset, batch_size = batch_size, shuffle=shuffle)
+        return None
+        
+def prepare_sample(object_table, test_size = 0.1, validation_size = 0.5, 
+                   scaler = StandardScaler(),
+                   shuffle_random_state = 2121805, 
+                   split_random_state_1 = 14101806,
+                   split_random_state_2 = 14061807):
+    object_table = shuffle(object_table, random_state=shuffle_random_state)
+    
+    X = object_table.drop(columns=["class", "label"])
+    y = object_table["label"].to_numpy().astype('int32')
+    objectID = object_table.index
+    
+    if test_size <= 0:
+        X_train, y_train, objectID_train = X, y, objectID
+        X_test, y_test, objectID_test = None, None, None
+    else:
+        X_train, X_test, y_train, y_test, objectID_train, objectID_test = train_test_split(X, y, 
+                                objectID, test_size = test_size, random_state = split_random_state_1)
+    
+    X_train, X_validation, y_train, y_validation, objectID_train, objectID_validation = train_test_split(X_train, y_train, 
+                                                                                    objectID_train, test_size = validation_size,
+                                                                                    random_state = split_random_state_2)
+    scaler.fit(X_train)
+    X_train = scaler.transform(X_train)
+    X_validation = scaler.transform(X_validation)
+    
+    if test_size > 0:
+        X_test = scaler.transform(X_test)
+    
+    train = sample_container(X_train, y_train, objectID_train)
+    validation = sample_container(X_validation, y_validation, objectID_validation)
+    test = sample_container(X_test, y_test, objectID_test)
+    
+
+    print("Returning train, validation and test objects")
+
+    return train, validation, test
+
+
+
+
+
+
+
+    
+
